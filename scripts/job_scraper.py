@@ -20,7 +20,7 @@ import json
 import logging
 import smtplib
 import textwrap
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
@@ -272,16 +272,82 @@ def normalise_jobspy_row(row: dict) -> dict:
 # Filters
 # ─────────────────────────────────────────────────────────────────────────────
 
-_QA_PATTERN = re.compile(
-    r"\b(qa|quality assurance|quality engineer|test engineer|sdet|"
-    r"automation engineer|test automation|performance test|security test|"
-    r"load test|e2e test|end.to.end test)\b",
+# Match ONLY against the job title — descriptions are far too noisy and let
+# unrelated roles (Sales, Backend, Support, etc.) slip through.
+_QA_TITLE_PATTERN = re.compile(
+    r"\b("
+    r"qa engineer|qa automation|qa lead|qa manager|qa analyst|qa tester|qa specialist|"
+    r"quality assurance|quality engineer|quality analyst|quality lead|quality manager|"
+    r"test engineer|test automation|test lead|test manager|test analyst|test architect|"
+    r"automation engineer|automation tester|automation qa|"
+    r"sdet|software development engineer in test|"
+    r"performance test|security test|load test|"
+    r"e2e engineer|end.to.end|"
+    r"software tester|manual tester|qa$"
+    r")\b",
     re.IGNORECASE,
 )
 
+# Explicit blocklist — titles that contain QA-adjacent words but are not QA roles
+_TITLE_BLOCKLIST = re.compile(
+    r"\b("
+    r"sales|erp|backend developer|frontend developer|full.?stack|"
+    r"customer support|call cent(re|er)|field engineer|instrumentation|"
+    r"audit|accountant|financial|marketing|data engineer|devops engineer|"
+    r"product manager|project manager|scrum master|business analyst"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
 def is_qa_relevant(job: dict) -> bool:
-    text = f"{job['title']} {job['description']}"
-    return bool(_QA_PATTERN.search(text))
+    title = job.get("title", "")
+    if _TITLE_BLOCKLIST.search(title):
+        return False
+    return bool(_QA_TITLE_PATTERN.search(title))
+
+
+def parse_posted_dt(job: dict) -> Optional[datetime]:
+    """Parse date_posted into an aware UTC datetime, or return None."""
+    raw = job.get("date_posted")
+    if raw is None:
+        return None
+    # pandas Timestamp / datetime.datetime
+    if hasattr(raw, "tzinfo"):
+        if raw.tzinfo is None:
+            return raw.replace(tzinfo=timezone.utc)
+        return raw.astimezone(timezone.utc)
+    # datetime.date (no time component)
+    if hasattr(raw, "year") and not hasattr(raw, "hour"):
+        return datetime(raw.year, raw.month, raw.day, tzinfo=timezone.utc)
+    s = str(raw).strip()
+    if not s or s.lower() in ("none", "nan", "nat", ""):
+        return None
+    # ISO datetime: "2026-05-08T10:30:00" or "...Z"
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        pass
+    # Date-only string: "2026-05-08"
+    try:
+        d = datetime.strptime(s[:10], "%Y-%m-%d")
+        return d.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    return None
+
+
+def is_posted_within_24h(job: dict) -> bool:
+    """Accept only jobs posted within the last 25 hours (buffer for clock skew)."""
+    dt = parse_posted_dt(job)
+    if dt is None:
+        log.debug("Skipping '%s' — no parseable date", job.get("title", "?"))
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=25)
+    return dt >= cutoff
 
 
 def is_remote(job: dict) -> bool:
@@ -561,7 +627,9 @@ def main() -> None:
     # ── 2. Filter ─────────────────────────────────────────────────────────────
     qualified = []
     for job in raw:
-        if not is_qa_relevant(job):
+        if not is_qa_relevant(job):        # title must match QA role pattern
+            continue
+        if not is_posted_within_24h(job):  # hard 25 h recency gate
             continue
         if not is_remote(job):
             continue
