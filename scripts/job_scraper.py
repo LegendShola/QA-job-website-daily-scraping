@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
 """
 Daily QA Job Scraper
-Searches multiple job boards for remote QA / QA Automation roles and
-emails a formatted digest to the configured recipient.
+Searches 6 job sources for remote QA / QA Automation roles and emails a
+formatted digest to the configured recipient.
 
-Environment variables required (set as GitHub Actions secrets):
-  SENDER_EMAIL      – Gmail address used to send the digest
-  SENDER_PASSWORD   – Gmail App Password (not your account password)
+Sources
+-------
+  1. Indeed + ZipRecruiter   – via python-jobspy (LinkedIn/Glassdoor blocked)
+  2. We Work Remotely        – dedicated QA RSS feed (most reliable free source)
+  3. Remotive API            – free JSON API, good remote-job coverage
+  4. RemoteOK API            – free JSON API with tag-based search
+  5. Greenhouse API          – public ATS boards for 30+ top startups
+  6. Lever API               – public ATS boards for 20+ top startups
+
+Environment variables (set as GitHub Actions secrets):
+  SENDER_EMAIL      – Gmail address to send from
+  SENDER_PASSWORD   – Gmail App Password (16-char, NOT your account password)
 
 Optional:
-  SMTP_HOST         – defaults to smtp.gmail.com
-  SMTP_PORT         – defaults to 587
-  EXCHANGE_RATE_API_KEY – exchangerate-api.com key for live USD→NGN rate
+  SMTP_HOST              – defaults to smtp.gmail.com
+  SMTP_PORT              – defaults to 587
+  EXCHANGE_RATE_API_KEY  – exchangerate-api.com key for live USD→NGN rate
 """
 
 import os
 import re
-import json
 import logging
 import smtplib
-import textwrap
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import parsedate_to_datetime
 from typing import Optional
 
 import requests
@@ -43,83 +52,85 @@ SENDER_PASSWORD = os.environ["SENDER_PASSWORD"]
 SMTP_HOST       = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT       = int(os.getenv("SMTP_PORT", "587"))
 
+# ── Date window ──────────────────────────────────────────────────────────────
+# Accept jobs posted within the last 72 h (3 days).
+# Job boards often index postings 24-48 h after they go live; a strict 24 h
+# window silently drops many fresh roles.
+MAX_AGE_HOURS = 72
+
 # ── Salary gate ──────────────────────────────────────────────────────────────
-# Minimum 2,000,000 NGN/month  (~$1,290 at 1 USD = 1550 NGN)
-MIN_NGN_MONTHLY   = 2_000_000
-FALLBACK_USD_RATE = 1_550          # used when live rate fetch fails
-MIN_USD_MONTHLY   = MIN_NGN_MONTHLY / FALLBACK_USD_RATE   # ≈ $1,290
-MIN_USD_ANNUAL    = MIN_USD_MONTHLY * 12                  # ≈ $15,484
+MIN_NGN_MONTHLY   = 2_000_000          # ₦2M/month minimum
+FALLBACK_USD_RATE = 1_580              # fallback if live rate fetch fails
 
 # ── Timezone acceptance ───────────────────────────────────────────────────────
-# WAT = UTC+1; accept roles in UTC-1 → UTC+3 (±2 h from WAT)
+# WAT = UTC+1; accept UTC−1 → UTC+3 (±2 h)
 ACCEPTED_TZ_TOKENS = {
-    # UTC-1
-    "CVT", "EGT", "AZOT",
-    # UTC 0
-    "GMT", "UTC", "WET", "UT",
-    # UTC+1  (WAT)
-    "WAT", "CET", "MET", "WEST",
-    # UTC+2
-    "CAT", "CEST", "WAST", "EET", "SAST",
-    # UTC+3
-    "EAT", "MSK", "AST", "EEST",
-    # Region keywords that imply an accepted timezone
-    "EUROPE", "UK", "EMEA", "AFRICA", "NIGERIA", "GHANA", "KENYA",
-    "SOUTH AFRICA", "GERMANY", "FRANCE", "NETHERLANDS", "POLAND",
+    "CVT", "EGT", "AZOT",                       # UTC-1
+    "GMT", "UTC", "WET", "UT",                   # UTC 0
+    "WAT", "CET", "MET", "WEST",                 # UTC+1
+    "CAT", "CEST", "WAST", "EET", "SAST",        # UTC+2
+    "EAT", "MSK", "AST", "EEST",                 # UTC+3
+    "EUROPE", "UK", "EMEA", "AFRICA",
+    "NIGERIA", "GHANA", "KENYA", "SOUTH AFRICA",
+    "GERMANY", "FRANCE", "NETHERLANDS", "POLAND",
     "SPAIN", "PORTUGAL", "ISRAEL", "TURKEY", "ROMANIA", "UKRAINE",
     "WORLDWIDE", "GLOBAL", "ANYWHERE",
 }
 
-# ── Search configuration ─────────────────────────────────────────────────────
-SEARCH_QUERIES = [
-    "QA Engineer",
+# ── JobSpy search terms ───────────────────────────────────────────────────────
+# Used only for Indeed + ZipRecruiter (LinkedIn/Glassdoor actively block scraping)
+JOBSPY_QUERIES = [
     "QA Automation Engineer",
-    "SDET",
-    "Test Automation Engineer",
-    "Quality Assurance Engineer",
-    "Performance Test Engineer",
-    "Security Test Engineer",
-    "Software Test Engineer",
+    "SDET remote",
+    "Test Automation Engineer remote",
+    "Quality Assurance Engineer remote",
+    "Performance Test Engineer remote",
+    "Security Test Engineer remote",
 ]
 
-# Keywords we look for in descriptions to surface as resume hints
+# ── Greenhouse / Lever company slugs ─────────────────────────────────────────
+# These companies use public ATS boards — no auth required
+GREENHOUSE_SLUGS = [
+    "stripe", "notion", "linear", "vercel", "figma", "retool",
+    "datadog", "snyk", "postman", "browserstack", "lambdatest",
+    "hashicorp", "confluent", "airbyte", "dbtlabs", "mixpanel",
+    "amplitude", "grafana", "pagerduty", "incident-io",
+    "atlassian", "gitlab", "circleci", "sonarqube",
+    "newrelic", "dynatrace", "saucelabs",
+]
+
+LEVER_SLUGS = [
+    "github", "figma", "notion", "linear", "vercel",
+    "segment", "heap", "percy", "chromatic", "testim",
+    "mabl", "rainforest-qa", "checkly",
+]
+
+# ── Resume skill keywords ─────────────────────────────────────────────────────
 SKILL_KEYWORDS = [
-    # Automation frameworks
     "Selenium", "Playwright", "Cypress", "Appium", "WebdriverIO",
     "TestNG", "JUnit", "pytest", "NUnit", "xUnit",
     "Robot Framework", "Cucumber", "SpecFlow", "Gherkin",
-    # Languages
     "Python", "Java", "JavaScript", "TypeScript", "C#", "Go", "Kotlin",
-    # CI/CD & DevOps
     "Jenkins", "GitHub Actions", "GitLab CI", "CircleCI", "Travis CI",
     "Docker", "Kubernetes", "Terraform", "Ansible",
-    # Performance
     "JMeter", "k6", "Gatling", "Locust", "LoadRunner",
-    # Security
     "OWASP", "Burp Suite", "ZAP", "Nessus", "Snyk", "Penetration Testing",
     "SAST", "DAST", "Vulnerability",
-    # API & Services
     "REST", "GraphQL", "gRPC", "Postman", "RestAssured", "Karate",
-    # Databases
     "SQL", "PostgreSQL", "MySQL", "MongoDB",
-    # Monitoring & Observability
     "Grafana", "Prometheus", "Datadog", "Splunk", "ELK",
-    # Methodology
     "BDD", "TDD", "Agile", "Scrum", "Shift-left",
     "Contract Testing", "Pact", "A/B Testing",
-    # Cloud
     "AWS", "GCP", "Azure", "Lambda", "S3",
-    # Mobile
     "iOS", "Android", "XCUITest", "Espresso",
 ]
 
-# Verified / well-known startup companies to prioritise
 PRIORITY_COMPANIES = {
     "stripe", "notion", "linear", "vercel", "figma", "retool",
     "datadog", "hashicorp", "confluent", "postman", "dbt labs",
     "airbyte", "segment", "mixpanel", "amplitude", "heap",
     "browserstack", "lambdatest", "sauce labs", "testim",
-    "mabl", "rainforest qa", "percy", "chromatic",
+    "mabl", "rainforest qa", "percy", "chromatic", "checkly",
     "github", "gitlab", "atlassian", "jetbrains", "circleci",
     "sonarqube", "snyk", "aqua security", "checkov",
     "grafana labs", "prometheus", "new relic", "dynatrace",
@@ -132,49 +143,157 @@ PRIORITY_COMPANIES = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_usd_to_ngn() -> float:
-    """Fetch live USD→NGN rate; fall back to constant if API is unavailable."""
     api_key = os.getenv("EXCHANGE_RATE_API_KEY")
     if api_key:
         try:
-            url = f"https://v6.exchangerate-api.com/v6/{api_key}/latest/USD"
-            resp = requests.get(url, timeout=10)
+            resp = requests.get(
+                f"https://v6.exchangerate-api.com/v6/{api_key}/latest/USD",
+                timeout=10,
+            )
             resp.raise_for_status()
-            rate = resp.json()["conversion_rates"]["NGN"]
+            rate = float(resp.json()["conversion_rates"]["NGN"])
             log.info("Live USD→NGN rate: %.2f", rate)
-            return float(rate)
+            return rate
         except Exception as exc:
-            log.warning("Rate fetch failed (%s); using fallback %d", exc, FALLBACK_USD_RATE)
+            log.warning("Rate fetch failed (%s); using fallback %.0f", exc, FALLBACK_USD_RATE)
     return float(FALLBACK_USD_RATE)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Job-board scrapers
+# Scrapers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _make_job(
+    title: str,
+    company: str,
+    location: str,
+    description: str,
+    url: str,
+    date_posted: str,
+    salary_text: str = "",
+    salary_min: float = 0.0,
+    salary_max: float = 0.0,
+    salary_interval: str = "yearly",
+    source: str = "",
+) -> dict:
+    return {
+        "title": title.strip(),
+        "company": company.strip(),
+        "location": location.strip() or "Remote",
+        "description": description,
+        "job_url": url,
+        "date_posted": date_posted,
+        "salary_text": salary_text,
+        "salary_min": salary_min,
+        "salary_max": salary_max,
+        "salary_interval": salary_interval,
+        "source": source,
+    }
+
+
+# ── 1. Indeed + ZipRecruiter via JobSpy ──────────────────────────────────────
+
 def scrape_jobspy(query: str) -> list[dict]:
-    """Scrape LinkedIn, Indeed, Glassdoor, and ZipRecruiter via JobSpy."""
+    """Indeed + ZipRecruiter only — LinkedIn and Glassdoor block scrapers."""
     try:
         df = scrape_jobs(
-            site_name=["linkedin", "indeed", "glassdoor", "zip_recruiter"],
+            site_name=["indeed", "zip_recruiter"],
             search_term=query,
             location="Remote",
-            results_wanted=20,
-            hours_old=25,           # only jobs posted in the last 25 h
+            results_wanted=25,
+            hours_old=MAX_AGE_HOURS,
             country_indeed="USA",
         )
-        jobs = df.to_dict("records") if not df.empty else []
+        if df is None or df.empty:
+            return []
+        jobs = []
+        for row in df.to_dict("records"):
+            s_min = float(row.get("min_amount") or 0)
+            s_max = float(row.get("max_amount") or 0)
+            interval = str(row.get("interval") or "yearly").lower()
+            s_text = ""
+            if s_min or s_max:
+                label = {"hourly": "/hr", "monthly": "/mo", "yearly": "/yr"}.get(interval, f"/{interval}")
+                s_text = f"${s_min:,.0f}–${s_max:,.0f}{label}" if s_max else f"${s_min:,.0f}+{label}"
+            # Convert pandas date to ISO string
+            raw_date = row.get("date_posted")
+            if hasattr(raw_date, "isoformat"):
+                date_str = raw_date.isoformat()
+            else:
+                date_str = str(raw_date or "")
+            jobs.append(_make_job(
+                title=str(row.get("title") or ""),
+                company=str(row.get("company") or ""),
+                location=str(row.get("location") or "Remote"),
+                description=str(row.get("description") or ""),
+                url=str(row.get("job_url") or ""),
+                date_posted=date_str,
+                salary_text=s_text,
+                salary_min=s_min,
+                salary_max=s_max,
+                salary_interval=interval,
+                source=str(row.get("site") or "JobSpy"),
+            ))
         log.info("JobSpy '%s': %d results", query, len(jobs))
         return jobs
     except Exception as exc:
-        log.warning("JobSpy error for '%s': %s", query, exc)
+        log.warning("JobSpy '%s' error: %s", query, exc)
         return []
 
 
-def fetch_remotive() -> list[dict]:
-    """Fetch QA jobs from the Remotive public API."""
-    categories = ["qa", "testing", "devops"]
+# ── 2. We Work Remotely RSS ──────────────────────────────────────────────────
+
+_WWR_FEEDS = [
+    "https://weworkremotely.com/categories/remote-testing-qa-jobs.rss",
+    "https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss",
+    "https://weworkremotely.com/categories/remote-software-dev-jobs.rss",
+]
+
+def fetch_weworkremotely() -> list[dict]:
     jobs: list[dict] = []
-    for cat in categories:
+    for feed_url in _WWR_FEEDS:
+        try:
+            resp = requests.get(
+                feed_url,
+                headers={"User-Agent": "Mozilla/5.0 (QA Job Digest Bot)"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+            ns = {"content": "http://purl.org/rss/1.0/modules/content/"}
+            for item in root.findall(".//item"):
+                title = (item.findtext("title") or "").strip()
+                # WWR format: "Company: Title  [Region]"
+                company, _, rest = title.partition(": ")
+                job_title = re.sub(r"\s*\[.*?\]", "", rest).strip() or title
+                pub_date = item.findtext("pubDate") or ""
+                try:
+                    dt = parsedate_to_datetime(pub_date).isoformat()
+                except Exception:
+                    dt = pub_date
+                region = item.findtext("region") or "Remote"
+                desc = item.findtext(f"content:encoded", namespaces=ns) or item.findtext("description") or ""
+                url = item.findtext("link") or item.findtext("guid") or ""
+                jobs.append(_make_job(
+                    title=job_title,
+                    company=company,
+                    location=region,
+                    description=desc,
+                    url=url,
+                    date_posted=dt,
+                    source="WeWorkRemotely",
+                ))
+        except Exception as exc:
+            log.warning("WWR feed %s error: %s", feed_url, exc)
+    log.info("We Work Remotely: %d raw results", len(jobs))
+    return jobs
+
+
+# ── 3. Remotive API ───────────────────────────────────────────────────────────
+
+def fetch_remotive() -> list[dict]:
+    jobs: list[dict] = []
+    for cat in ["qa", "testing", "devops"]:
         try:
             resp = requests.get(
                 "https://remotive.com/api/remote-jobs",
@@ -183,97 +302,140 @@ def fetch_remotive() -> list[dict]:
             )
             resp.raise_for_status()
             for j in resp.json().get("jobs", []):
-                jobs.append({
-                    "title": j.get("title", ""),
-                    "company": j.get("company_name", ""),
-                    "location": j.get("candidate_required_location", "Remote"),
-                    "description": j.get("description", ""),
-                    "job_url": j.get("url", ""),
-                    "date_posted": j.get("publication_date", ""),
-                    "salary_text": j.get("salary", ""),
-                    "source": "Remotive",
-                    "company_logo": j.get("company_logo", ""),
-                })
+                jobs.append(_make_job(
+                    title=j.get("title", ""),
+                    company=j.get("company_name", ""),
+                    location=j.get("candidate_required_location", "Remote"),
+                    description=j.get("description", ""),
+                    url=j.get("url", ""),
+                    date_posted=j.get("publication_date", ""),
+                    salary_text=j.get("salary", ""),
+                    source="Remotive",
+                ))
         except Exception as exc:
             log.warning("Remotive '%s' error: %s", cat, exc)
     log.info("Remotive: %d raw results", len(jobs))
     return jobs
 
 
+# ── 4. RemoteOK API ───────────────────────────────────────────────────────────
+
 def fetch_remoteok() -> list[dict]:
-    """Fetch QA/test jobs from the RemoteOK public API."""
-    tags = ["qa", "testing", "selenium", "playwright", "automation"]
     jobs: list[dict] = []
-    for tag in tags:
+    for tag in ["qa", "testing", "selenium", "playwright", "automation"]:
         try:
             resp = requests.get(
                 f"https://remoteok.com/api?tag={tag}",
-                headers={"User-Agent": "Mozilla/5.0 (QA Job Scraper)"},
+                headers={"User-Agent": "Mozilla/5.0 (QA Job Digest Bot)"},
                 timeout=15,
             )
             resp.raise_for_status()
-            data = resp.json()
-            for j in data:
+            for j in resp.json():
                 if not isinstance(j, dict) or "position" not in j:
                     continue
-                jobs.append({
-                    "title": j.get("position", ""),
-                    "company": j.get("company", ""),
-                    "location": j.get("location", "Remote"),
-                    "description": j.get("description", ""),
-                    "job_url": j.get("url", ""),
-                    "date_posted": j.get("date", ""),
-                    "salary_text": "",
-                    "source": "RemoteOK",
-                    "company_logo": j.get("company_logo", ""),
-                })
+                # epoch field is a Unix timestamp integer
+                epoch = j.get("epoch")
+                if epoch:
+                    dt = datetime.fromtimestamp(int(epoch), tz=timezone.utc).isoformat()
+                else:
+                    dt = j.get("date", "")
+                jobs.append(_make_job(
+                    title=j.get("position", ""),
+                    company=j.get("company", ""),
+                    location=j.get("location", "Remote"),
+                    description=j.get("description", ""),
+                    url=j.get("url", ""),
+                    date_posted=dt,
+                    source="RemoteOK",
+                ))
         except Exception as exc:
             log.warning("RemoteOK '%s' error: %s", tag, exc)
     log.info("RemoteOK: %d raw results", len(jobs))
     return jobs
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Normalisation helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ── 5. Greenhouse public ATS API ──────────────────────────────────────────────
 
-def normalise_jobspy_row(row: dict) -> dict:
-    """Convert a JobSpy DataFrame row into our canonical dict."""
-    salary_min = row.get("min_amount") or 0
-    salary_max = row.get("max_amount") or 0
-    salary_interval = str(row.get("interval") or "yearly").lower()
-    salary_text = ""
-    if salary_min or salary_max:
-        interval_label = {"hourly": "/hr", "monthly": "/mo", "yearly": "/yr"}.get(
-            salary_interval, f"/{salary_interval}"
-        )
-        salary_text = (
-            f"${salary_min:,.0f}–${salary_max:,.0f}{interval_label}"
-            if salary_max
-            else f"${salary_min:,.0f}+{interval_label}"
-        )
-    return {
-        "title": str(row.get("title") or ""),
-        "company": str(row.get("company") or ""),
-        "location": str(row.get("location") or "Remote"),
-        "description": str(row.get("description") or ""),
-        "job_url": str(row.get("job_url") or ""),
-        "date_posted": str(row.get("date_posted") or ""),
-        "salary_text": salary_text,
-        "salary_min": float(salary_min),
-        "salary_max": float(salary_max),
-        "salary_interval": salary_interval,
-        "source": str(row.get("site") or "JobSpy"),
-        "company_logo": "",
-    }
+def fetch_greenhouse() -> list[dict]:
+    jobs: list[dict] = []
+    for slug in GREENHOUSE_SLUGS:
+        try:
+            resp = requests.get(
+                f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs",
+                params={"content": "true"},
+                timeout=10,
+            )
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            company_name = slug.replace("-", " ").title()
+            for j in resp.json().get("jobs", []):
+                location = ""
+                for loc in j.get("offices", []) or j.get("location", {}).values():
+                    if isinstance(loc, dict):
+                        location = loc.get("name", "")
+                    else:
+                        location = str(loc)
+                    break
+                if not location:
+                    location = j.get("location", {}).get("name", "Remote")
+                jobs.append(_make_job(
+                    title=j.get("title", ""),
+                    company=company_name,
+                    location=location or "Remote",
+                    description=j.get("content", ""),
+                    url=j.get("absolute_url", ""),
+                    date_posted=j.get("updated_at", ""),
+                    source="Greenhouse",
+                ))
+        except Exception as exc:
+            log.debug("Greenhouse '%s' error: %s", slug, exc)
+    log.info("Greenhouse: %d raw results", len(jobs))
+    return jobs
+
+
+# ── 6. Lever public ATS API ───────────────────────────────────────────────────
+
+def fetch_lever() -> list[dict]:
+    jobs: list[dict] = []
+    for slug in LEVER_SLUGS:
+        try:
+            resp = requests.get(
+                f"https://api.lever.co/v0/postings/{slug}",
+                params={"mode": "json"},
+                timeout=10,
+            )
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            company_name = slug.replace("-", " ").title()
+            for j in resp.json():
+                location = j.get("categories", {}).get("location", "Remote")
+                # Lever uses createdAt as millisecond epoch
+                created_ms = j.get("createdAt")
+                if created_ms:
+                    dt = datetime.fromtimestamp(int(created_ms) / 1000, tz=timezone.utc).isoformat()
+                else:
+                    dt = ""
+                jobs.append(_make_job(
+                    title=j.get("text", ""),
+                    company=company_name,
+                    location=location,
+                    description=j.get("descriptionPlain", "") or j.get("description", ""),
+                    url=j.get("hostedUrl", ""),
+                    date_posted=dt,
+                    source="Lever",
+                ))
+        except Exception as exc:
+            log.debug("Lever '%s' error: %s", slug, exc)
+    log.info("Lever: %d raw results", len(jobs))
+    return jobs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Filters
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Match ONLY against the job title — descriptions are far too noisy and let
-# unrelated roles (Sales, Backend, Support, etc.) slip through.
 _QA_TITLE_PATTERN = re.compile(
     r"\b("
     r"qa engineer|qa automation|qa lead|qa manager|qa analyst|qa tester|qa specialist|"
@@ -283,18 +445,20 @@ _QA_TITLE_PATTERN = re.compile(
     r"sdet|software development engineer in test|"
     r"performance test|security test|load test|"
     r"e2e engineer|end.to.end|"
-    r"software tester|manual tester|qa$"
-    r")\b",
+    r"software tester|manual tester"
+    r")\b"
+    r"|(?<!\w)qa(?!\w)",          # standalone "QA" not part of another word
     re.IGNORECASE,
 )
 
-# Explicit blocklist — titles that contain QA-adjacent words but are not QA roles
 _TITLE_BLOCKLIST = re.compile(
     r"\b("
-    r"sales|erp|backend developer|frontend developer|full.?stack|"
+    r"sales|erp|backend developer|frontend developer|full.?stack developer|"
     r"customer support|call cent(re|er)|field engineer|instrumentation|"
-    r"audit|accountant|financial|marketing|data engineer|devops engineer|"
-    r"product manager|project manager|scrum master|business analyst"
+    r"internal audit|accountant|financial|marketing|data engineer|"
+    r"devops engineer|site reliability engineer|sre|"
+    r"product manager|project manager|scrum master|business analyst|"
+    r"software engineer(?! in test)|staff engineer(?! in test)"
     r")\b",
     re.IGNORECASE,
 )
@@ -308,22 +472,18 @@ def is_qa_relevant(job: dict) -> bool:
 
 
 def parse_posted_dt(job: dict) -> Optional[datetime]:
-    """Parse date_posted into an aware UTC datetime, or return None."""
     raw = job.get("date_posted")
     if raw is None:
         return None
-    # pandas Timestamp / datetime.datetime
-    if hasattr(raw, "tzinfo"):
+    if hasattr(raw, "tzinfo"):          # datetime / pandas Timestamp
         if raw.tzinfo is None:
             return raw.replace(tzinfo=timezone.utc)
         return raw.astimezone(timezone.utc)
-    # datetime.date (no time component)
-    if hasattr(raw, "year") and not hasattr(raw, "hour"):
+    if hasattr(raw, "year") and not hasattr(raw, "hour"):   # date object
         return datetime(raw.year, raw.month, raw.day, tzinfo=timezone.utc)
     s = str(raw).strip()
     if not s or s.lower() in ("none", "nan", "nat", ""):
         return None
-    # ISO datetime: "2026-05-08T10:30:00" or "...Z"
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         if dt.tzinfo is None:
@@ -331,62 +491,46 @@ def parse_posted_dt(job: dict) -> Optional[datetime]:
         return dt.astimezone(timezone.utc)
     except ValueError:
         pass
-    # Date-only string: "2026-05-08"
     try:
-        d = datetime.strptime(s[:10], "%Y-%m-%d")
-        return d.replace(tzinfo=timezone.utc)
+        return datetime.strptime(s[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except ValueError:
         pass
     return None
 
 
-def is_posted_within_24h(job: dict) -> bool:
-    """Accept only jobs posted within the last 25 hours (buffer for clock skew)."""
+def is_posted_recently(job: dict) -> bool:
+    """Accept jobs posted within MAX_AGE_HOURS; include those with no date."""
     dt = parse_posted_dt(job)
     if dt is None:
-        log.debug("Skipping '%s' — no parseable date", job.get("title", "?"))
-        return False
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=25)
+        return True   # unknown date — include, flag in email as "date unknown"
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=MAX_AGE_HOURS)
     return dt >= cutoff
 
 
 def is_remote(job: dict) -> bool:
     location = job.get("location", "").lower()
-    return "remote" in location or location.strip() == ""
+    return "remote" in location or location.strip() in ("", "worldwide", "global", "anywhere")
 
 
 def is_timezone_ok(job: dict) -> bool:
-    """Return True if the job mentions an acceptable timezone or no timezone at all."""
     text = (job.get("description", "") + " " + job.get("location", "")).upper()
-
-    # If no timezone restriction is mentioned, assume it's open → accept
     tz_mentions = re.findall(r"\bUTC[+-]\d+\b|\b[A-Z]{2,4}T\b|UTC[+-]?\d*", text)
     if not tz_mentions:
         return True
-
-    # Check for explicit UTC offsets in ±2 h of WAT (UTC+1 = +1)
     for tok in tz_mentions:
-        match = re.match(r"UTC([+-])(\d+)", tok)
-        if match:
-            sign = 1 if match.group(1) == "+" else -1
-            offset = sign * int(match.group(2))
-            if -1 <= offset <= 3:   # WAT±2
+        m = re.match(r"UTC([+-])(\d+)", tok)
+        if m:
+            sign = 1 if m.group(1) == "+" else -1
+            offset = sign * int(m.group(2))
+            if -1 <= offset <= 3:
                 return True
-
-    # Check for known tz abbreviations / region keywords
     for token in ACCEPTED_TZ_TOKENS:
         if token in text:
             return True
-
     return False
 
 
 def parse_salary_usd_annual(job: dict) -> Optional[float]:
-    """
-    Return the best annual USD salary estimate we can derive.
-    Returns None if the posting provides no salary data.
-    """
-    # JobSpy structured salary
     if job.get("salary_min") or job.get("salary_max"):
         value = job["salary_max"] or job["salary_min"]
         interval = job.get("salary_interval", "yearly")
@@ -394,44 +538,30 @@ def parse_salary_usd_annual(job: dict) -> Optional[float]:
             return value * 2080
         if interval == "monthly":
             return value * 12
-        return value   # yearly
-
-    # Text-based fallback (Remotive / RemoteOK)
+        return value
     text = job.get("salary_text", "") + " " + job.get("description", "")
     amounts = re.findall(r"\$\s?([\d,]+)(?:k)?", text, re.IGNORECASE)
     if not amounts:
         return None
-
-    nums = [float(a.replace(",", "")) * (1000 if "k" in text[text.find(a):text.find(a)+10].lower() else 1)
-            for a in amounts]
-    annual_guess = max(nums)
-    # If value looks like a monthly rate (< 20k), annualise it
-    if annual_guess < 20_000:
-        annual_guess *= 12
-    return annual_guess
+    nums = []
+    for a in amounts:
+        n = float(a.replace(",", ""))
+        ctx = text[text.find(a): text.find(a) + 10].lower()
+        if "k" in ctx:
+            n *= 1000
+        nums.append(n)
+    annual = max(nums)
+    if annual < 20_000:
+        annual *= 12
+    return annual
 
 
 def salary_ok(job: dict, usd_rate: float) -> bool:
-    """Return True if salary is above threshold OR undisclosed (we include those)."""
     annual = parse_salary_usd_annual(job)
     if annual is None:
-        return True   # include jobs that don't disclose salary
+        return True
     min_annual_usd = (MIN_NGN_MONTHLY * 12) / usd_rate
     return annual >= min_annual_usd
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Keyword extraction
-# ─────────────────────────────────────────────────────────────────────────────
-
-def extract_keywords(description: str) -> list[str]:
-    """Return matched skill keywords found in the job description."""
-    found = []
-    desc_upper = description.upper()
-    for kw in SKILL_KEYWORDS:
-        if kw.upper() in desc_upper:
-            found.append(kw)
-    return found
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -439,7 +569,7 @@ def extract_keywords(description: str) -> list[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def deduplicate(jobs: list[dict]) -> list[dict]:
-    seen: set[str] = set()
+    seen: set[tuple] = set()
     unique: list[dict] = []
     for job in jobs:
         key = (job["title"].lower().strip(), job["company"].lower().strip())
@@ -447,6 +577,15 @@ def deduplicate(jobs: list[dict]) -> list[dict]:
             seen.add(key)
             unique.append(job)
     return unique
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Keyword extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_keywords(description: str) -> list[str]:
+    desc_upper = description.upper()
+    return [kw for kw in SKILL_KEYWORDS if kw.upper() in desc_upper]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -463,9 +602,11 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#f4f6f9;margin:0;padding
 .body{padding:24px 32px}
 .summary{background:#e8f0fe;border-left:4px solid #1a73e8;padding:12px 16px;
          border-radius:0 6px 6px 0;margin-bottom:24px;font-size:13px;color:#333}
+.source-bar{margin-bottom:20px;font-size:12px;color:#555}
+.source-bar span{display:inline-block;background:#f1f3f4;border-radius:4px;
+                 padding:2px 8px;margin:2px 4px 2px 0}
 .job-card{border:1px solid #e0e0e0;border-radius:8px;margin-bottom:20px;overflow:hidden}
-.job-header{background:#fafafa;padding:14px 18px;display:flex;
-            align-items:center;gap:14px;border-bottom:1px solid #e0e0e0}
+.job-header{background:#fafafa;padding:14px 18px;border-bottom:1px solid #e0e0e0}
 .job-title{font-size:16px;font-weight:600;color:#1a73e8;margin:0}
 .job-meta{font-size:12px;color:#666;margin:4px 0 0}
 .job-body{padding:14px 18px}
@@ -476,6 +617,7 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#f4f6f9;margin:0;padding
 .badge-orange{background:#fef3e2;color:#e37400}
 .badge-red{background:#fce8e6;color:#c5221f}
 .badge-purple{background:#f3e8fd;color:#7b1fa2}
+.badge-grey{background:#f1f3f4;color:#555}
 .kw-section{margin-top:12px}
 .kw-section h4{font-size:12px;color:#555;margin:0 0 6px;text-transform:uppercase;letter-spacing:.5px}
 .apply-btn{display:inline-block;margin-top:12px;padding:9px 20px;background:#1a73e8;
@@ -484,98 +626,90 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#f4f6f9;margin:0;padding
 .footer{background:#f4f6f9;padding:16px 32px;font-size:11px;color:#999;text-align:center}
 """
 
-def salary_to_ngn(job: dict, usd_rate: float) -> str:
+def _salary_str(job: dict, usd_rate: float) -> str:
     annual = parse_salary_usd_annual(job)
     if annual is None:
         return "Not disclosed"
     monthly_ngn = (annual / 12) * usd_rate
     if job.get("salary_text"):
         return f"₦{monthly_ngn:,.0f}/mo  ({job['salary_text']})"
-    return f"₦{monthly_ngn:,.0f}/mo  (${annual/1000:.0f}k/yr)"
+    return f"₦{monthly_ngn:,.0f}/mo  (≈${annual/1000:.0f}k/yr)"
 
 
-def build_badge(text: str, colour: str) -> str:
-    return f'<span class="badge badge-{colour}">{text}</span>'
+def _type_badges(job: dict) -> str:
+    t = (job["title"] + " " + job["description"]).lower()
+    out = []
+    if any(k in t for k in ["selenium","playwright","cypress","appium","webdriver"]):
+        out.append('<span class="badge badge-blue">UI Automation</span>')
+    if any(k in t for k in ["jmeter","k6","gatling","locust","performance","load test"]):
+        out.append('<span class="badge badge-orange">Performance</span>')
+    if any(k in t for k in ["security","owasp","burp","pentest","sast","dast"]):
+        out.append('<span class="badge badge-red">Security</span>')
+    if any(k in t for k in ["api","rest","graphql","postman","restassured"]):
+        out.append('<span class="badge badge-green">API Testing</span>')
+    if any(k in t for k in ["mobile","ios","android","xcuitest","espresso"]):
+        out.append('<span class="badge badge-purple">Mobile</span>')
+    return "".join(out) or '<span class="badge badge-blue">QA</span>'
 
 
-def job_type_badges(job: dict) -> str:
-    title_desc = (job["title"] + " " + job["description"]).lower()
-    badges = []
-    if any(k in title_desc for k in ["selenium","playwright","cypress","appium","webdriver"]):
-        badges.append(build_badge("UI Automation", "blue"))
-    if any(k in title_desc for k in ["jmeter","k6","gatling","locust","performance","load test"]):
-        badges.append(build_badge("Performance", "orange"))
-    if any(k in title_desc for k in ["security","owasp","burp","pentest","sast","dast"]):
-        badges.append(build_badge("Security", "red"))
-    if any(k in title_desc for k in ["api","rest","graphql","postman","restassured"]):
-        badges.append(build_badge("API Testing", "green"))
-    if any(k in title_desc for k in ["mobile","ios","android","appium","xcuitest","espresso"]):
-        badges.append(build_badge("Mobile", "purple"))
-    return "".join(badges) or build_badge("QA", "blue")
-
-
-def job_to_html_card(job: dict, usd_rate: float, index: int) -> str:
-    keywords = extract_keywords(job["description"])
-    kw_html = " ".join(
-        f'<span class="badge badge-blue">{kw}</span>' for kw in keywords[:20]
-    )
-    salary_str = salary_to_ngn(job, usd_rate)
+def _card(job: dict, usd_rate: float, idx: int) -> str:
+    kws = extract_keywords(job["description"])
+    kw_html = " ".join(f'<span class="badge badge-blue">{k}</span>' for k in kws[:20])
     company = job["company"] or "Unknown"
-    location = job["location"] or "Remote"
-    source = job.get("source", "")
-    date_str = str(job.get("date_posted", ""))[:10]
-    url = job.get("job_url", "#")
-    is_priority = company.lower().strip() in PRIORITY_COMPANIES
-    company_label = f"⭐ {company}" if is_priority else company
-
+    is_p = company.lower().strip() in PRIORITY_COMPANIES
+    company_label = f"⭐ {company}" if is_p else company
+    dt = parse_posted_dt(job)
+    date_label = dt.strftime("%Y-%m-%d") if dt else "date unknown"
     return f"""
 <div class="job-card">
   <div class="job-header">
-    <div>
-      <p class="job-title">{index}. {job['title']}</p>
-      <p class="job-meta">
-        🏢 {company_label} &nbsp;|&nbsp; 📍 {location}
-        &nbsp;|&nbsp; 📅 {date_str} &nbsp;|&nbsp; 🔗 {source}
-      </p>
-    </div>
+    <p class="job-title">{idx}. {job['title']}</p>
+    <p class="job-meta">
+      🏢 {company_label} &nbsp;|&nbsp; 📍 {job['location']}
+      &nbsp;|&nbsp; 📅 {date_label} &nbsp;|&nbsp; 🔗 {job.get('source','')}
+    </p>
   </div>
   <div class="job-body">
-    <div>{job_type_badges(job)}</div>
+    <div>{_type_badges(job)}</div>
     <p style="margin:10px 0 4px;font-size:13px">
-      <strong>💰 Salary:</strong> {salary_str}
+      <strong>💰 Salary:</strong> {_salary_str(job, usd_rate)}
     </p>
     <div class="kw-section">
       <h4>Resume keywords from this posting</h4>
-      {kw_html if kw_html else '<span style="color:#999;font-size:12px">No matched keywords</span>'}
+      {kw_html or '<span style="color:#999;font-size:12px">No matched keywords</span>'}
     </div>
-    <a class="apply-btn" href="{url}" target="_blank">Apply Now →</a>
+    <a class="apply-btn" href="{job.get('job_url','#')}" target="_blank">Apply Now →</a>
   </div>
-</div>
-"""
+</div>"""
 
 
-def build_email_html(jobs: list[dict], usd_rate: float, today: str) -> str:
+def build_email_html(jobs: list[dict], usd_rate: float, today: str, stats: dict) -> str:
     count = len(jobs)
-    cards = "".join(job_to_html_card(j, usd_rate, i + 1) for i, j in enumerate(jobs))
+    cards = "".join(_card(j, usd_rate, i + 1) for i, j in enumerate(jobs))
+    source_chips = "".join(
+        f'<span>{src}: {n}</span>'
+        for src, n in sorted(stats.items())
+    )
+    no_results = '<p style="color:#999;text-align:center;padding:40px 0">No new QA jobs matched your criteria in the last 72 h. Check back tomorrow!</p>'
     return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>{_CSS}</style></head>
+<html><head><meta charset="utf-8"><style>{_CSS}</style></head>
 <body>
 <div class="wrapper">
   <div class="header">
     <h1>🔍 Daily QA Jobs Digest — {today}</h1>
-    <p>Remote QA / Automation roles within WAT ±2 h | salary ≥ ₦2M/mo equivalent</p>
+    <p>Remote QA / Automation roles within WAT ±2 h &nbsp;|&nbsp; salary ≥ ₦2M/mo &nbsp;|&nbsp; posted ≤ 72 h ago</p>
   </div>
   <div class="body">
     <div class="summary">
-      Found <strong>{count} qualified job(s)</strong> posted in the last 24 hours.
-      Exchange rate used: <strong>1 USD = ₦{usd_rate:,.0f}</strong>.
+      Found <strong>{count} qualified job(s)</strong>.
+      Exchange rate: <strong>1 USD = ₦{usd_rate:,.0f}</strong>.
     </div>
-    {cards if cards else '<p style="color:#999;text-align:center;padding:40px 0">No new jobs matched your criteria today. Check back tomorrow!</p>'}
+    <div class="source-bar">Sources checked today: {source_chips}</div>
+    {cards if cards else no_results}
   </div>
   <div class="footer">
-    Scraped from LinkedIn · Indeed · Glassdoor · ZipRecruiter · Remotive · RemoteOK<br>
-    Unsubscribe by disabling the GitHub Actions workflow in your repository.
+    Indeed · ZipRecruiter · We Work Remotely · Remotive · RemoteOK · Greenhouse · Lever<br>
+    Disable the GitHub Actions workflow in your repo to stop receiving these emails.
   </div>
 </div>
 </body></html>"""
@@ -591,7 +725,6 @@ def send_email(html_body: str, subject: str) -> None:
     msg["From"]    = SENDER_EMAIL
     msg["To"]      = RECIPIENT_EMAIL
     msg.attach(MIMEText(html_body, "html"))
-
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
         server.ehlo()
         server.starttls()
@@ -610,55 +743,57 @@ def main() -> None:
 
     usd_rate = get_usd_to_ngn()
 
-    # ── 1. Collect raw jobs ───────────────────────────────────────────────────
+    # ── 1. Collect raw jobs from all sources ──────────────────────────────────
     raw: list[dict] = []
 
-    # JobSpy (LinkedIn / Indeed / Glassdoor / ZipRecruiter)
-    for query in SEARCH_QUERIES:
-        for row in scrape_jobspy(query):
-            raw.append(normalise_jobspy_row(row))
+    for query in JOBSPY_QUERIES:
+        raw.extend(scrape_jobspy(query))
 
-    # Free REST APIs
+    raw.extend(fetch_weworkremotely())
     raw.extend(fetch_remotive())
     raw.extend(fetch_remoteok())
+    raw.extend(fetch_greenhouse())
+    raw.extend(fetch_lever())
 
-    log.info("Total raw records: %d", len(raw))
+    log.info("Total raw records before filtering: %d", len(raw))
 
-    # ── 2. Filter ─────────────────────────────────────────────────────────────
-    qualified = []
-    for job in raw:
-        if not is_qa_relevant(job):        # title must match QA role pattern
-            continue
-        if not is_posted_within_24h(job):  # hard 25 h recency gate
-            continue
-        if not is_remote(job):
-            continue
-        if not is_timezone_ok(job):
-            continue
-        if not salary_ok(job, usd_rate):
-            continue
-        qualified.append(job)
+    # ── 2. Filter with per-stage counts for debugging ─────────────────────────
+    after_qa        = [j for j in raw             if is_qa_relevant(j)]
+    after_recency   = [j for j in after_qa        if is_posted_recently(j)]
+    after_remote    = [j for j in after_recency   if is_remote(j)]
+    after_tz        = [j for j in after_remote    if is_timezone_ok(j)]
+    after_salary    = [j for j in after_tz        if salary_ok(j, usd_rate)]
 
-    log.info("After filtering: %d jobs", len(qualified))
+    log.info(
+        "Filter funnel: raw=%d → qa_title=%d → recency=%d → remote=%d → tz=%d → salary=%d",
+        len(raw), len(after_qa), len(after_recency),
+        len(after_remote), len(after_tz), len(after_salary),
+    )
 
-    # ── 3. Deduplicate & sort (priority companies first) ──────────────────────
+    qualified = after_salary
+
+    # ── 3. Deduplicate & sort (priority companies first, then newest) ─────────
     qualified = deduplicate(qualified)
     qualified.sort(
         key=lambda j: (
             0 if j["company"].lower().strip() in PRIORITY_COMPANIES else 1,
-            j.get("date_posted", "") or "",
+            -(parse_posted_dt(j) or datetime.min.replace(tzinfo=timezone.utc)).timestamp(),
         ),
-        reverse=False,
     )
-    qualified = qualified[:50]   # cap at 50 per digest
+    qualified = qualified[:50]
 
     log.info("Final digest size: %d jobs", len(qualified))
 
-    # ── 4. Build & send email ─────────────────────────────────────────────────
-    html = build_email_html(qualified, usd_rate, today)
-    subject = f"[QA Jobs] {len(qualified)} remote QA role(s) – {today}"
-    send_email(html, subject)
+    # ── 4. Source breakdown for email header ──────────────────────────────────
+    source_stats: dict[str, int] = {}
+    for j in qualified:
+        src = j.get("source", "Other")
+        source_stats[src] = source_stats.get(src, 0) + 1
 
+    # ── 5. Build & send email ─────────────────────────────────────────────────
+    html = build_email_html(qualified, usd_rate, today, source_stats)
+    subject = f"[QA Jobs] {len(qualified)} remote role(s) – {today}"
+    send_email(html, subject)
     log.info("Done.")
 
 
