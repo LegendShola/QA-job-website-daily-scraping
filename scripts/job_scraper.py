@@ -32,6 +32,7 @@ import logging
 import smtplib
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
+from difflib import SequenceMatcher
 from datetime import date, datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -525,7 +526,10 @@ _QA_TITLE_PATTERN = re.compile(
     r"sdet|software development engineer in test|"
     r"performance test|security test|load test|"
     r"e2e engineer|end.to.end|"
-    r"software tester|manual tester"
+    r"software tester|manual tester|"
+    r"mobile qa analyst|senior software quality assurance analyst|software test engineer|"
+    r"senior quality engineer|engineer, qa automation|senior qa engineer|"
+    r"product tester|senior qa mobile|qa mobile|mobile qa"
     r")\b"
     r"|(?<!\w)qa(?!\w)",          # standalone "QA" not part of another word
     re.IGNORECASE,
@@ -544,11 +548,64 @@ _TITLE_BLOCKLIST = re.compile(
 )
 
 
+# Canonical QA titles for fuzzy-match fallback. Mirrors _QA_TITLE_PATTERN
+# alternations but as plain strings so SequenceMatcher can compare against them.
+_CANONICAL_QA_TITLES = [
+    "qa engineer", "qa automation engineer", "qa lead", "qa manager",
+    "qa analyst", "qa tester", "qa specialist",
+    "qa mobile", "mobile qa", "mobile qa analyst", "senior qa mobile",
+    "senior qa engineer", "engineer qa automation",
+    "quality assurance engineer", "quality assurance analyst",
+    "senior software quality assurance analyst",
+    "quality engineer", "quality analyst", "quality lead", "quality manager",
+    "senior quality engineer",
+    "test engineer", "test automation engineer", "test lead", "test manager",
+    "test analyst", "test architect", "software test engineer",
+    "automation engineer", "automation tester",
+    "sdet", "software development engineer in test",
+    "performance test engineer", "security test engineer", "load test engineer",
+    "software tester", "manual tester", "product tester",
+]
+
+FUZZY_TITLE_THRESHOLD = 0.80
+
+
+def _normalize_title(s: str) -> str:
+    """Lowercase + collapse punctuation to spaces for fair fuzzy comparison."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", s.lower())).strip()
+
+
+def _best_qa_fuzzy_score(title: str) -> tuple[float, str]:
+    """Highest similarity ratio between a normalized title and any canonical QA title."""
+    norm = _normalize_title(title)
+    if not norm:
+        return 0.0, ""
+    best_score = 0.0
+    best_match = ""
+    for canonical in _CANONICAL_QA_TITLES:
+        # Exact substring → 1.0 (handles "Senior X", "X II", "X (Remote)" etc.)
+        if canonical in norm:
+            return 1.0, canonical
+        score = SequenceMatcher(None, norm, canonical).ratio()
+        if score > best_score:
+            best_score = score
+            best_match = canonical
+    return best_score, best_match
+
+
 def is_qa_relevant(job: dict) -> bool:
     title = job.get("title", "")
     if _TITLE_BLOCKLIST.search(title):
         return False
-    return bool(_QA_TITLE_PATTERN.search(title))
+    if _QA_TITLE_PATTERN.search(title):
+        return True
+    # Fuzzy fallback: catch titles the strict regex misses (abbreviations,
+    # unusual punctuation, slight word variations).
+    score, canonical = _best_qa_fuzzy_score(title)
+    if score >= FUZZY_TITLE_THRESHOLD:
+        log.info("Fuzzy match: %r ≈ %r (%.2f)", title, canonical, score)
+        return True
+    return False
 
 
 def parse_posted_dt(job: dict) -> Optional[datetime]:
