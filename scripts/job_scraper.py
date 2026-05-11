@@ -567,7 +567,7 @@ _CANONICAL_QA_TITLES = [
     "software tester", "manual tester", "product tester",
 ]
 
-FUZZY_TITLE_THRESHOLD = 0.80
+FUZZY_TITLE_THRESHOLD = 0.90
 
 
 def _normalize_title(s: str) -> str:
