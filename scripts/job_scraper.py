@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Daily QA Job Scraper
-Searches 6 job sources for remote QA / QA Automation roles and emails a
+Searches 9 job sources for remote QA / QA Automation roles and emails a
 formatted digest to the configured recipient.
 
 Sources
@@ -13,6 +13,8 @@ Sources
   5. Greenhouse API          – public ATS boards for 30+ top startups
   6. Lever API               – public ATS boards for 20+ top startups
   7. Jobright (jobright.ai)  – HTML scrape of server-rendered Next.js __NEXT_DATA__
+  8. Jobicy API              – free public JSON API, includes salary range
+  9. Working Nomads API      – free public JSON, strong timezone-aware metadata
 
 Environment variables (set as GitHub Actions secrets):
   SENDER_EMAIL      – Gmail address to send from
@@ -513,6 +515,78 @@ def fetch_jobright() -> list[dict]:
     return jobs
 
 
+# ── 8. Jobicy public JSON API ─────────────────────────────────────────────────
+# Docs: https://jobicy.com/feed/job_feed/json — free, no auth.
+# We pull the latest 50 jobs across all industries and rely on the QA title
+# filter to keep what's relevant. Their `tag=qa` filter returns 0 in practice.
+
+def fetch_jobicy() -> list[dict]:
+    jobs: list[dict] = []
+    try:
+        resp = requests.get(
+            "https://jobicy.com/api/v2/remote-jobs",
+            params={"count": 50},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        for j in resp.json().get("jobs", []):
+            s_min = float(j.get("annualSalaryMin") or 0)
+            s_max = float(j.get("annualSalaryMax") or 0)
+            currency = (j.get("salaryCurrency") or "USD").upper()
+            salary_text = ""
+            if s_min or s_max:
+                if s_max:
+                    salary_text = f"{currency} {s_min:,.0f}–{s_max:,.0f}/yr"
+                else:
+                    salary_text = f"{currency} {s_min:,.0f}+/yr"
+            jobs.append(_make_job(
+                title=j.get("jobTitle", ""),
+                company=j.get("companyName", ""),
+                location=j.get("jobGeo", "") or "Remote",
+                description=j.get("jobDescription", "") or j.get("jobExcerpt", ""),
+                url=j.get("url", ""),
+                date_posted=j.get("pubDate", ""),
+                salary_text=salary_text,
+                salary_min=s_min,
+                salary_max=s_max,
+                salary_interval="yearly",
+                source="Jobicy",
+            ))
+    except Exception as exc:
+        log.warning("Jobicy fetch error: %s", exc)
+    log.info("Jobicy: %d raw results", len(jobs))
+    return jobs
+
+
+# ── 9. Working Nomads public JSON API ─────────────────────────────────────────
+# `/api/exposed_jobs/` returns a flat array of the most recent jobs across all
+# categories. Good signal for European/timezone-aware remote roles.
+
+def fetch_workingnomads() -> list[dict]:
+    jobs: list[dict] = []
+    try:
+        resp = requests.get(
+            "https://www.workingnomads.com/api/exposed_jobs/",
+            headers={"User-Agent": "Mozilla/5.0 (QA Job Digest Bot)"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        for j in resp.json():
+            jobs.append(_make_job(
+                title=j.get("title", ""),
+                company=j.get("company_name", ""),
+                location=j.get("location", "") or "Remote",
+                description=j.get("description", "") or "",
+                url=j.get("url", ""),
+                date_posted=j.get("pub_date", ""),
+                source="Working Nomads",
+            ))
+    except Exception as exc:
+        log.warning("Working Nomads fetch error: %s", exc)
+    log.info("Working Nomads: %d raw results", len(jobs))
+    return jobs
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Filters
 # ─────────────────────────────────────────────────────────────────────────────
@@ -899,7 +973,7 @@ def build_email_html(jobs: list[dict], usd_rate: float, today: str, stats: dict)
     {cards if cards else no_results}
   </div>
   <div class="footer">
-    Indeed · ZipRecruiter · We Work Remotely · Remotive · RemoteOK · Greenhouse · Lever · Jobright<br>
+    Indeed · ZipRecruiter · We Work Remotely · Remotive · RemoteOK · Greenhouse · Lever · Jobright · Jobicy · Working Nomads<br>
     Disable the GitHub Actions workflow in your repo to stop receiving these emails.
   </div>
 </div>
@@ -946,6 +1020,8 @@ def main() -> None:
     raw.extend(fetch_greenhouse())
     raw.extend(fetch_lever())
     raw.extend(fetch_jobright())
+    raw.extend(fetch_jobicy())
+    raw.extend(fetch_workingnomads())
 
     log.info("Total raw records before filtering: %d", len(raw))
 
