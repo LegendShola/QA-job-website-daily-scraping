@@ -2,8 +2,11 @@ name: Daily QA Job Digest
 
 on:
   schedule:
-    # 09:00 UTC = 10:00 WAT (UTC+1) — Monday through Friday
-    - cron: "0 9 * * 1-5"
+    # 09:07 UTC = 10:07 WAT (UTC+1) — Monday through Friday.
+    # Note: GitHub Actions cron is best-effort. Top-of-hour (:00) is the worst
+    # slot because millions of jobs queue at once. An off-cycle minute like :07
+    # fires far more reliably (delays of 15-60 min are routine on free tier).
+    - cron: "7 9 * * 1-5"
   workflow_dispatch:   # allow manual trigger from the Actions tab
 
 jobs:
