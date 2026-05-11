@@ -12,6 +12,7 @@ Sources
   4. RemoteOK API            – free JSON API with tag-based search
   5. Greenhouse API          – public ATS boards for 30+ top startups
   6. Lever API               – public ATS boards for 20+ top startups
+  7. Jobright (jobright.ai)  – HTML scrape of server-rendered Next.js __NEXT_DATA__
 
 Environment variables (set as GitHub Actions secrets):
   SENDER_EMAIL      – Gmail address to send from
@@ -26,6 +27,7 @@ Optional:
 import os
 import re
 import html
+import json
 import logging
 import smtplib
 import xml.etree.ElementTree as ET
@@ -434,6 +436,82 @@ def fetch_lever() -> list[dict]:
     return jobs
 
 
+# ── 7. Jobright (jobright.ai) — server-rendered __NEXT_DATA__ JSON ────────────
+#
+# Jobright has no public API. The /remote-jobs page is a Next.js app that
+# server-renders the first 30 search results into an inline <script id="__NEXT_DATA__">
+# JSON blob, which we parse. This is fragile: a frontend refactor could change
+# the key path or move the data to client-side hydration. If results suddenly
+# drop to 0 from this source, inspect the page HTML and update the JSON path.
+#
+# robots.txt explicitly allows /jobs/* and /remote-jobs/*, so this is permitted.
+
+_JOBRIGHT_TITLES = ",".join([
+    "QA Engineer", "QA Automation Engineer", "SDET",
+    "Test Automation Engineer", "Quality Assurance Engineer",
+    "Software Test Engineer", "Performance Test Engineer",
+    "Security Test Engineer", "Test Engineer", "Automation Engineer",
+])
+
+_JOBRIGHT_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def fetch_jobright() -> list[dict]:
+    """Parse Jobright's server-rendered job results from __NEXT_DATA__."""
+    jobs: list[dict] = []
+    try:
+        resp = requests.get(
+            "https://jobright.ai/remote-jobs",
+            params={"jobTitle": _JOBRIGHT_TITLES},
+            headers={"User-Agent": _JOBRIGHT_BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        m = re.search(
+            r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+            resp.text, re.DOTALL,
+        )
+        if not m:
+            log.warning("Jobright: __NEXT_DATA__ block not found — page structure may have changed")
+            return jobs
+        data = json.loads(m.group(1))
+        items = data.get("props", {}).get("pageProps", {}).get("defaultData", []) or []
+        for item in items:
+            jr = item.get("jobResult") or {}
+            cr = item.get("companyResult") or {}
+            if not jr.get("jobTitle"):
+                continue
+            # publishTime arrives as "YYYY-MM-DD HH:MM:SS" in UTC
+            raw_dt = (jr.get("publishTime") or "").strip()
+            date_iso = ""
+            if raw_dt:
+                try:
+                    dt = datetime.strptime(raw_dt, "%Y-%m-%d %H:%M:%S")
+                    date_iso = dt.replace(tzinfo=timezone.utc).isoformat()
+                except ValueError:
+                    date_iso = raw_dt
+            location = jr.get("jobLocation") or ""
+            is_remote_flag = str(jr.get("isRemote", "")).lower() in ("true", "1")
+            if is_remote_flag:
+                location = f"Remote — {location}" if location else "Remote"
+            jobs.append(_make_job(
+                title=jr.get("jobTitle", ""),
+                company=cr.get("companyName") or "Unknown",
+                location=location,
+                description=jr.get("jobSummary", "") or "",
+                url=jr.get("applyLink") or jr.get("url") or "",
+                date_posted=date_iso,
+                source="Jobright",
+            ))
+    except Exception as exc:
+        log.warning("Jobright fetch error: %s", exc)
+    log.info("Jobright: %d raw results", len(jobs))
+    return jobs
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Filters
 # ─────────────────────────────────────────────────────────────────────────────
@@ -764,7 +842,7 @@ def build_email_html(jobs: list[dict], usd_rate: float, today: str, stats: dict)
     {cards if cards else no_results}
   </div>
   <div class="footer">
-    Indeed · ZipRecruiter · We Work Remotely · Remotive · RemoteOK · Greenhouse · Lever<br>
+    Indeed · ZipRecruiter · We Work Remotely · Remotive · RemoteOK · Greenhouse · Lever · Jobright<br>
     Disable the GitHub Actions workflow in your repo to stop receiving these emails.
   </div>
 </div>
@@ -810,6 +888,7 @@ def main() -> None:
     raw.extend(fetch_remoteok())
     raw.extend(fetch_greenhouse())
     raw.extend(fetch_lever())
+    raw.extend(fetch_jobright())
 
     log.info("Total raw records before filtering: %d", len(raw))
 
