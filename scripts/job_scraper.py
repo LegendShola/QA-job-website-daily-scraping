@@ -25,9 +25,11 @@ Optional:
 
 import os
 import re
+import html
 import logging
 import smtplib
 import xml.etree.ElementTree as ET
+from urllib.parse import urlparse
 from datetime import date, datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -626,13 +628,57 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#f4f6f9;margin:0;padding
 .footer{background:#f4f6f9;padding:16px 32px;font-size:11px;color:#999;text-align:center}
 """
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Output sanitization — every field below originates from external job boards
+# (Indeed posters, Lever boards, etc.) and must be treated as untrusted.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MAX_FIELD_LEN = 500   # cap any single field to avoid runaway HTML payloads
+
+
+def _safe_text(value, max_len: int = _MAX_FIELD_LEN) -> str:
+    """HTML-escape a value, coerce to string, and truncate to max_len chars."""
+    if value is None:
+        return ""
+    s = str(value)
+    if len(s) > max_len:
+        s = s[:max_len] + "…"
+    return html.escape(s, quote=True)
+
+
+def _safe_url(value) -> str:
+    """Return value only if it is an http(s) URL; otherwise '#'."""
+    if not value:
+        return "#"
+    try:
+        parsed = urlparse(str(value))
+    except ValueError:
+        return "#"
+    if parsed.scheme not in ("http", "https"):
+        return "#"
+    if not parsed.netloc:
+        return "#"
+    return html.escape(str(value), quote=True)
+
+
+def _valid_job(job: dict) -> bool:
+    """Reject jobs that are missing required string fields or malformed."""
+    title = job.get("title")
+    company = job.get("company")
+    if not isinstance(title, str) or not title.strip():
+        return False
+    if not isinstance(company, str) or not company.strip():
+        return False
+    return True
+
+
 def _salary_str(job: dict, usd_rate: float) -> str:
     annual = parse_salary_usd_annual(job)
     if annual is None:
         return "Not disclosed"
     monthly_ngn = (annual / 12) * usd_rate
     if job.get("salary_text"):
-        return f"₦{monthly_ngn:,.0f}/mo  ({job['salary_text']})"
+        return f"₦{monthly_ngn:,.0f}/mo  ({_safe_text(job['salary_text'], 100)})"
     return f"₦{monthly_ngn:,.0f}/mo  (≈${annual/1000:.0f}k/yr)"
 
 
@@ -653,20 +699,30 @@ def _type_badges(job: dict) -> str:
 
 
 def _card(job: dict, usd_rate: float, idx: int) -> str:
-    kws = extract_keywords(job["description"])
+    # SKILL_KEYWORDS is a hardcoded allowlist, so kw_html is safe by construction.
+    kws = extract_keywords(job.get("description", ""))
     kw_html = " ".join(f'<span class="badge badge-blue">{k}</span>' for k in kws[:20])
-    company = job["company"] or "Unknown"
-    is_p = company.lower().strip() in PRIORITY_COMPANIES
-    company_label = f"⭐ {company}" if is_p else company
+
+    company_raw = (job.get("company") or "Unknown").strip()
+    is_p = company_raw.lower() in PRIORITY_COMPANIES
+    company_safe = _safe_text(company_raw, 200)
+    company_label = f"⭐ {company_safe}" if is_p else company_safe
+
     dt = parse_posted_dt(job)
     date_label = dt.strftime("%Y-%m-%d") if dt else "date unknown"
+
+    title_safe    = _safe_text(job.get("title", ""), 250)
+    location_safe = _safe_text(job.get("location", "Remote"), 150)
+    source_safe   = _safe_text(job.get("source", ""), 50)
+    url_safe      = _safe_url(job.get("job_url"))
+
     return f"""
 <div class="job-card">
   <div class="job-header">
-    <p class="job-title">{idx}. {job['title']}</p>
+    <p class="job-title">{idx}. {title_safe}</p>
     <p class="job-meta">
-      🏢 {company_label} &nbsp;|&nbsp; 📍 {job['location']}
-      &nbsp;|&nbsp; 📅 {date_label} &nbsp;|&nbsp; 🔗 {job.get('source','')}
+      🏢 {company_label} &nbsp;|&nbsp; 📍 {location_safe}
+      &nbsp;|&nbsp; 📅 {date_label} &nbsp;|&nbsp; 🔗 {source_safe}
     </p>
   </div>
   <div class="job-body">
@@ -678,7 +734,7 @@ def _card(job: dict, usd_rate: float, idx: int) -> str:
       <h4>Resume keywords from this posting</h4>
       {kw_html or '<span style="color:#999;font-size:12px">No matched keywords</span>'}
     </div>
-    <a class="apply-btn" href="{job.get('job_url','#')}" target="_blank">Apply Now →</a>
+    <a class="apply-btn" href="{url_safe}" target="_blank" rel="noopener noreferrer">Apply Now →</a>
   </div>
 </div>"""
 
@@ -758,15 +814,16 @@ def main() -> None:
     log.info("Total raw records before filtering: %d", len(raw))
 
     # ── 2. Filter with per-stage counts for debugging ─────────────────────────
-    after_qa        = [j for j in raw             if is_qa_relevant(j)]
+    after_shape     = [j for j in raw             if _valid_job(j)]
+    after_qa        = [j for j in after_shape     if is_qa_relevant(j)]
     after_recency   = [j for j in after_qa        if is_posted_recently(j)]
     after_remote    = [j for j in after_recency   if is_remote(j)]
     after_tz        = [j for j in after_remote    if is_timezone_ok(j)]
     after_salary    = [j for j in after_tz        if salary_ok(j, usd_rate)]
 
     log.info(
-        "Filter funnel: raw=%d → qa_title=%d → recency=%d → remote=%d → tz=%d → salary=%d",
-        len(raw), len(after_qa), len(after_recency),
+        "Filter funnel: raw=%d → shape=%d → qa_title=%d → recency=%d → remote=%d → tz=%d → salary=%d",
+        len(raw), len(after_shape), len(after_qa), len(after_recency),
         len(after_remote), len(after_tz), len(after_salary),
     )
 
