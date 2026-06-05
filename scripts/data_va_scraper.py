@@ -53,7 +53,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Recipients ───────────────────────────────────────────────────────────────
-RECIPIENT_EMAIL = "fafilaoyinkansola@gmail.com"
+RECIPIENT_EMAILS = ["fafilaoyinkansola@gmail.com", "olawunmitolulope6@gmail.com"]
 SENDER_EMAIL    = os.environ["SENDER_EMAIL"]
 SENDER_PASSWORD = os.environ["SENDER_PASSWORD"]
 SMTP_HOST       = os.getenv("SMTP_HOST", "smtp.gmail.com")
@@ -1043,14 +1043,14 @@ def send_email(html_body: str, subject: str) -> None:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = SENDER_EMAIL
-    msg["To"]      = RECIPIENT_EMAIL
+    msg["To"]      = ", ".join(RECIPIENT_EMAILS)
     msg.attach(MIMEText(html_body, "html"))
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
         server.ehlo()
         server.starttls()
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
-        server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-    log.info("Email sent → %s", RECIPIENT_EMAIL)
+        server.sendmail(SENDER_EMAIL, RECIPIENT_EMAILS, msg.as_string())
+    log.info("Email sent → %s", ", ".join(RECIPIENT_EMAILS))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
