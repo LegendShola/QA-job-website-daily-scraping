@@ -67,7 +67,7 @@ MAX_AGE_HOURS = 72
 
 # ── Salary gate ──────────────────────────────────────────────────────────────
 MIN_NGN_MONTHLY   = 2_000_000          # ₦2M/month minimum
-FALLBACK_USD_RATE = 1_580              # fallback if live rate fetch fails
+FALLBACK_USD_RATE = 1_360              # fallback if live rate fetch fails
 
 # ── Timezone acceptance ───────────────────────────────────────────────────────
 # WAT = UTC+1; accept UTC−1 → UTC+3 (±2 h)

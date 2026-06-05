@@ -66,8 +66,8 @@ SMTP_PORT       = int(os.getenv("SMTP_PORT", "587"))
 MAX_AGE_HOURS = 72
 
 # ── Salary gate ──────────────────────────────────────────────────────────────
-MIN_NGN_MONTHLY   = 400_000          # ₦400,000/month minimum
-FALLBACK_USD_RATE = 1_580              # fallback if live rate fetch fails
+MIN_NGN_MONTHLY   = 500_000          # ₦500,000/month minimum
+FALLBACK_USD_RATE = 1_360              # fallback if live rate fetch fails
 
 # ── Timezone acceptance ───────────────────────────────────────────────────────
 # WAT = UTC+1; accept UTC−1 → UTC+3 (±2 h)
@@ -1017,7 +1017,7 @@ def build_email_html(jobs: list[dict], usd_rate: float, today: str, stats: dict)
 <div class="wrapper">
   <div class="header">
     <h1>📊 Daily Data Analyst & Virtual Assistant Jobs — {today}</h1>
-    <p>Remote DA / VA roles within WAT ±2 h &nbsp;|&nbsp; salary ≥ ₦2M/mo &nbsp;|&nbsp; posted ≤ 72 h ago</p>
+    <p>Remote DA / VA roles within WAT ±2 h &nbsp;|&nbsp; salary ≥ ₦500k/mo &nbsp;|&nbsp; posted ≤ 72 h ago</p>
   </div>
   <div class="body">
     <div class="summary">
