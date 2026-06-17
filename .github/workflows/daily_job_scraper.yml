@@ -18,11 +18,11 @@ jobs:
     steps:
       # ── 1. Checkout ──────────────────────────────────────────────────────────
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # ── 2. Python setup ──────────────────────────────────────────────────────
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -47,7 +47,7 @@ jobs:
       # ── 5. Upload log on failure ──────────────────────────────────────────────
       - name: Upload scraper log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: scraper-log-${{ github.run_id }}
           path: "*.log"
