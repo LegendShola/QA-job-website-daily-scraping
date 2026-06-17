@@ -22,7 +22,7 @@ are kept only for resilience — the title filter discards their tech results.
 
 Sources
 -------
-  1. Indeed (Nigeria) + ZipRecruiter – via python-jobspy  ← primary source
+  1. Indeed (Nigeria)        – via python-jobspy  ← primary source
   2. We Work Remotely        – RSS feeds (best-effort; mostly tech)
   3. Remotive API            – free JSON API, finance categories
   4. RemoteOK API            – free JSON API with finance/fintech tags
@@ -100,8 +100,8 @@ NIGERIA_LOCATION_TOKENS = {
 }
 
 # ── JobSpy search terms ───────────────────────────────────────────────────────
-# Used for Indeed (country=Nigeria) + ZipRecruiter. Indeed-Nigeria is the
-# primary engine for this scraper.
+# Used for Indeed (country=Nigeria). Indeed-Nigeria is the primary engine for
+# this scraper.
 JOBSPY_QUERIES = [
     "Trade Finance Officer",
     "Trade Finance Specialist",
@@ -231,10 +231,13 @@ def _make_job(
 # ── 1. Indeed (Nigeria) + ZipRecruiter via JobSpy ────────────────────────────
 
 def scrape_jobspy(query: str) -> list[dict]:
-    """Indeed (country=Nigeria) + ZipRecruiter — the primary engine here."""
+    """Indeed (country=Nigeria) — the primary engine here.
+
+    ZipRecruiter is intentionally excluded: it ignores country_indeed and only
+    returns US listings, which are noise for this Nigeria-based on-site role."""
     try:
         df = scrape_jobs(
-            site_name=["indeed", "zip_recruiter"],
+            site_name=["indeed"],
             search_term=query,
             location="Nigeria",
             results_wanted=25,
@@ -883,14 +886,19 @@ def is_posted_recently(job: dict) -> bool:
 
 
 def is_location_ok(job: dict) -> bool:
-    """Accept Nigeria-based roles; remote / worldwide postings are also fine."""
+    """Accept ONLY Nigeria-based (or West-/pan-African) roles.
+
+    This is an on-site Lagos/Abuja role and the recipient is Nigeria-based, so a
+    bare 'Remote' / 'Worldwide' / empty / US location is NOT enough — those are
+    dominated by US/global remote postings that aren't relevant. We require an
+    explicit Nigerian signal; a remote role still qualifies if it names Nigeria
+    (e.g. 'Remote — Nigeria') or Africa."""
     location = (job.get("location", "") or "").lower()
-    stripped = location.strip()
-    if not stripped or stripped in ("worldwide", "global", "anywhere"):
+    if any(tok in location for tok in NIGERIA_LOCATION_TOKENS):
         return True
-    if "remote" in location:
+    if "africa" in location:          # 'Africa', 'West Africa', 'Remote, Africa'
         return True
-    return any(tok in location for tok in NIGERIA_LOCATION_TOKENS)
+    return False
 
 
 def parse_salary_usd_annual(job: dict) -> Optional[float]:
@@ -1125,7 +1133,7 @@ def build_email_html(jobs: list[dict], usd_rate: float, today: str, stats: dict)
 <div class="wrapper">
   <div class="header">
     <h1>🌍 Daily Trade Finance & International Trade Jobs — {today}</h1>
-    <p>Trade finance / LC / loan-ops roles in Nigeria (remote OK) &nbsp;|&nbsp; salary ≥ ₦250k/mo &nbsp;|&nbsp; posted ≤ 72 h ago</p>
+    <p>Trade finance / LC / loan-ops roles in Nigeria (remote OK) &nbsp;|&nbsp; salary ≥ ₦500k/mo &nbsp;|&nbsp; posted ≤ 72 h ago</p>
   </div>
   <div class="body">
     <div class="summary">
@@ -1136,7 +1144,7 @@ def build_email_html(jobs: list[dict], usd_rate: float, today: str, stats: dict)
     {cards if cards else no_results}
   </div>
   <div class="footer">
-    Indeed (Nigeria) · ZipRecruiter · We Work Remotely · Remotive · RemoteOK · Greenhouse · Lever · Jobright · Jobicy · Working Nomads · MyJobMag<br>
+    Indeed (Nigeria) · We Work Remotely · Remotive · RemoteOK · Greenhouse · Lever · Jobright · Jobicy · Working Nomads · MyJobMag<br>
     Disable the GitHub Actions workflow in your repo to stop receiving these emails.
   </div>
 </div>
