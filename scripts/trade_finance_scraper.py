@@ -71,7 +71,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Recipients ───────────────────────────────────────────────────────────────
-RECIPIENT_EMAILS = ["adebayoayoola018@gmail.com", "shola.mich.7438@gmail.com"]
+RECIPIENT_EMAILS = ["adebayoayoola018@gmail.com"]
 SENDER_EMAIL    = os.environ["SENDER_EMAIL"]
 SENDER_PASSWORD = os.environ["SENDER_PASSWORD"]
 SMTP_HOST       = os.getenv("SMTP_HOST", "smtp.gmail.com")
@@ -111,6 +111,8 @@ JOBSPY_QUERIES = [
     "Loan Operations Officer",
     "International Trade Specialist",
     "Treasury Operations Officer",
+    "Reconciliation Analyst",
+    "Letter of Credit Officer",
 ]
 
 # ── Greenhouse / Lever company slugs ─────────────────────────────────────────
@@ -488,7 +490,7 @@ _JOBRIGHT_TITLES = ",".join([
     "Trade Services Officer", "Trade Operations Officer",
     "Letters of Credit Officer", "International Trade Specialist",
     "Loan Operations Officer", "Treasury Operations Officer",
-    "Credit Operations Officer",
+    "Credit Operations Officer", "Reconciliation Analyst",
 ])
 
 _JOBRIGHT_BROWSER_UA = (
@@ -755,7 +757,7 @@ _QA_TITLE_PATTERN = re.compile(
     r"trade finance|trade services|trade operations|trade specialist|"
     r"trade officer|trade analyst|trade desk|trade product|trade sales|"
     r"international trade|structured trade|trade documentation|"
-    r"letters? of credit|documentary credit|documentary collection|"
+    r"letters? of credit|lc establishment|documentary credit|documentary collection|"
     r"import.{0,4}officer|export.{0,4}officer|import.{0,4}export|"
     r"correspondent banking|"
     # Loan booking / credit & treasury operations family
@@ -763,7 +765,10 @@ _QA_TITLE_PATTERN = re.compile(
     r"credit operations|credit administration|credit analyst|"
     r"treasury operations|foreign operations|trade finance operations|"
     r"fx operations|forex operations|banking operations officer|"
-    r"operations officer"
+    r"operations officer|"
+    # Reconciliation family (covers "Reconciliation Analyst", "Account
+    # Reconciliation Officer", "Reconciliations Specialist", etc.)
+    r"reconciliations?"
     r")\b",
     re.IGNORECASE,
 )
@@ -797,7 +802,8 @@ _CANONICAL_QA_TITLES = [
     "trade services officer", "trade services specialist",
     "trade operations officer", "trade operations analyst",
     "international trade specialist", "international trade officer",
-    "letters of credit officer", "documentary credit officer",
+    "letters of credit officer", "letter of credit establishment officer",
+    "documentary credit officer",
     "trade documentation officer", "import officer", "export officer",
     "import export officer", "correspondent banking officer",
     "structured trade finance officer",
@@ -806,6 +812,9 @@ _CANONICAL_QA_TITLES = [
     "loan officer", "credit operations officer", "credit administration officer",
     "treasury operations officer", "foreign operations officer",
     "banking operations officer",
+    # Reconciliation
+    "reconciliation analyst", "reconciliation officer",
+    "reconciliation specialist", "account reconciliation officer",
 ]
 
 FUZZY_TITLE_THRESHOLD = 0.90
